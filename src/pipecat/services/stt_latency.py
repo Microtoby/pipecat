@@ -57,4 +57,5 @@ WHISPER_TTFS_P99: float = DEFAULT_TTFS_P99
 # No benchmark available yet; using conservative default
 MISTRAL_TTFS_P99: float = DEFAULT_TTFS_P99
 SMALLEST_TTFS_P99: float = DEFAULT_TTFS_P99
+VOLCENGINE_TTFS_P99: float = DEFAULT_TTFS_P99
 XAI_TTFS_P99: float = DEFAULT_TTFS_P99

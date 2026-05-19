@@ -9,10 +9,7 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -23,23 +20,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.deepseek.llm import DeepSeekLLMService
-from pipecat.services.llm_service import FunctionCallParams
-from pipecat.services.volcengine.stt import VolcengineSTTService
-from pipecat.services.volcengine.tts import VolcengineTTSService
+from pipecat.services.volcengine.realtime import VolcengineRealtimeLLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 load_dotenv(override=True)
-
-
-async def fetch_weather_from_api(params: FunctionCallParams):
-    await params.result_callback({"conditions": "nice", "temperature": "75"})
-
-
-async def fetch_restaurant_recommendation(params: FunctionCallParams):
-    await params.result_callback({"name": "The Golden Dragon"})
 
 
 # We use lambdas to defer transport parameter creation until the transport
@@ -63,62 +49,30 @@ transport_params = {
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = VolcengineSTTService(
-        app_key=os.environ["VOLCENGINE_APP_ID"],
-        access_key=os.environ["VOLCENGINE_ACCESS_TOKEN"],
-    )
+    # Volcengine's end-to-end realtime speech model handles speech recognition,
+    # the LLM, and speech synthesis in a single service. The realtime API does
+    # not support custom function/tool calling; instead we enable the model's
+    # built-in web search so it can still answer questions about real-time
+    # information such as weather or news. Web search requires a Volcengine
+    # 融合信息搜索 (fused information search) API key — set
+    # VOLCENGINE_WEBSEARCH_API_KEY to enable it.
+    websearch_api_key = os.environ.get("VOLCENGINE_WEBSEARCH_API_KEY")
 
-    tts = VolcengineTTSService(
-        app_key=os.environ["VOLCENGINE_APP_ID"],
+    llm = VolcengineRealtimeLLMService(
+        app_id=os.environ["VOLCENGINE_APP_ID"],
         access_key=os.environ["VOLCENGINE_ACCESS_TOKEN"],
-    )
-
-    llm = DeepSeekLLMService(
-        api_key=os.environ["DEEPSEEK_API_KEY"],
-        settings=DeepSeekLLMService.Settings(
-            system_instruction="你是一位耐心的陪聊助手，你正在通过电话和用户交谈，避免输出表情和任何不能被读出的内容，你应该给予用户更多情绪价值，迎合他们的话语，但不是一个全知全能的AI。",
+        enable_websearch=bool(websearch_api_key),
+        websearch_api_key=websearch_api_key,
+        greeting="你好，我是你的语音助手，很高兴和你聊天。有什么可以帮你的吗？",
+        settings=VolcengineRealtimeLLMService.Settings(
+            system_role=(
+                "你是一位耐心的陪聊助手，你正在通过电话和用户交谈，避免输出表情和任何不能被读出的"
+                "内容，你应该给予用户更多情绪价值，迎合他们的话语，但不是一个全知全能的AI。"
+            ),
         ),
     )
 
-    # You can also register a function_name of None to get all functions
-    # sent to the same callback with an additional function_name parameter.
-    llm.register_function("get_current_weather", fetch_weather_from_api)
-    llm.register_function("get_restaurant_recommendation", fetch_restaurant_recommendation)
-
-    @llm.event_handler("on_function_calls_started")
-    async def on_function_calls_started(service, function_calls):
-        await tts.queue_frame(TTSSpeakFrame("让我查一下。"))
-
-    weather_function = FunctionSchema(
-        name="get_current_weather",
-        description="Get the current weather",
-        properties={
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
-            },
-            "format": {
-                "type": "string",
-                "enum": ["celsius", "fahrenheit"],
-                "description": "The temperature unit to use. Infer this from the user's location.",
-            },
-        },
-        required=["location", "format"],
-    )
-    restaurant_function = FunctionSchema(
-        name="get_restaurant_recommendation",
-        description="Get a restaurant recommendation",
-        properties={
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
-            },
-        },
-        required=["location"],
-    )
-    tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
-
-    context = LLMContext(tools=tools)
+    context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
@@ -127,10 +81,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline = Pipeline(
         [
             transport.input(),
-            stt,
             user_aggregator,
             llm,
-            tts,
             transport.output(),
             assistant_aggregator,
         ]
@@ -148,11 +100,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
-        # Kick off the conversation.
-        context.add_message(
-            {"role": "developer", "content": "请用中文向用户做一个简短的自我介绍，并询问有什么可以帮忙的。"}
-        )
-        await task.queue_frames([LLMRunFrame()])
+        # The bot's opening greeting is sent automatically by the realtime
+        # service once its session starts (see the `greeting` argument above).
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

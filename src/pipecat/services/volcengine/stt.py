@@ -48,11 +48,11 @@ except ModuleNotFoundError as e:
     logger.error("In order to use Volcengine, you need to `pip install pipecat-ai[volcengine]`.")
     raise Exception(f"Missing module: {e}")
 
-# Default WebSocket endpoint for the optimized big-model bidirectional streaming ASR.
-VOLCENGINE_BIGMODEL_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+# Default WebSocket endpoint for the big-model bidirectional streaming ASR.
+VOLCENGINE_BIGMODEL_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 
-# Default resource id (duration-based billing) for the 2.0 big-model streaming ASR.
-VOLCENGINE_BIGMODEL_RESOURCE_ID = "volc.seedasr.sauc.duration"
+# Default resource id (duration-based billing) for the big-model streaming ASR.
+VOLCENGINE_BIGMODEL_RESOURCE_ID = "volc.bigasr.sauc.duration"
 
 #
 # Volcengine binary protocol constants.
@@ -169,7 +169,9 @@ class VolcengineSTTService(WebsocketSTTService):
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: str | None = None,
+        app_key: str | None = None,
+        access_key: str | None = None,
         resource_id: str = VOLCENGINE_BIGMODEL_RESOURCE_ID,
         url: str = VOLCENGINE_BIGMODEL_URL,
         uid: str = "pipecat",
@@ -182,11 +184,16 @@ class VolcengineSTTService(WebsocketSTTService):
     ):
         """Initialize the Volcengine STT service.
 
-        Uses the new Volcengine console authentication mode. Provide ``api_key``,
-        which is sent as the ``X-Api-Key`` WebSocket header.
+        Supports two authentication modes. Provide either ``api_key`` (new
+        unified console key, sent as ``X-Api-Key``) or both ``app_key`` and
+        ``access_key`` (classic speech-service credentials, sent as
+        ``X-Api-App-Key`` / ``X-Api-Access-Key``).
 
         Args:
             api_key: Volcengine unified API key, sent as the ``X-Api-Key`` header.
+            app_key: Volcengine App ID, sent as the ``X-Api-App-Key`` header.
+            access_key: Volcengine Access Token, sent as the ``X-Api-Access-Key``
+                header.
             resource_id: Billing resource id, sent as the ``X-Api-Resource-Id``
                 header. Defaults to the duration-based 2.0 big-model ASR resource.
             url: WebSocket endpoint URL. Defaults to the optimized big-model
@@ -206,10 +213,14 @@ class VolcengineSTTService(WebsocketSTTService):
             **kwargs: Additional arguments passed to the parent STTService.
 
         Raises:
-            ValueError: If ``api_key`` is empty.
+            ValueError: If neither ``api_key`` nor both ``app_key`` and
+                ``access_key`` are provided.
         """
-        if not api_key:
-            raise ValueError("VolcengineSTTService requires 'api_key'.")
+        if not api_key and not (app_key and access_key):
+            raise ValueError(
+                "VolcengineSTTService requires either 'api_key' or both "
+                "'app_key' and 'access_key'."
+            )
         default_settings = self.Settings(
             model="bigmodel",
             language=None,
@@ -230,6 +241,8 @@ class VolcengineSTTService(WebsocketSTTService):
         )
 
         self._api_key = api_key
+        self._app_key = app_key
+        self._access_key = access_key
         self._resource_id = resource_id
         self._url = url
         self._uid = uid
@@ -372,12 +385,16 @@ class VolcengineSTTService(WebsocketSTTService):
             logger.debug(f"{self} connecting to Volcengine WebSocket")
 
             headers = {
-                "X-Api-Key": self._api_key,
                 "X-Api-Resource-Id": self._resource_id,
                 "X-Api-Connect-Id": self._connect_id,
                 "X-Api-Request-Id": str(uuid.uuid4()),
                 "X-Api-Sequence": "-1",
             }
+            if self._api_key:
+                headers["X-Api-Key"] = self._api_key
+            else:
+                headers["X-Api-App-Key"] = self._app_key
+                headers["X-Api-Access-Key"] = self._access_key
             self._websocket = await websocket_connect(self._url, additional_headers=headers)
 
             payload = self._build_request_payload()

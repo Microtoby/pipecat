@@ -33,6 +33,7 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     InputTextRawFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -346,6 +347,12 @@ class VolcengineRealtimeLLMService(LLMService):
         uid: str = "pipecat",
         input_sample_rate: int = 16000,
         output_sample_rate: int = 24000,
+        enable_websearch: bool = False,
+        websearch_api_key: str | None = None,
+        websearch_type: str | None = None,
+        websearch_bot_id: str | None = None,
+        websearch_result_count: int | None = None,
+        greeting: str | None = None,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -361,6 +368,21 @@ class VolcengineRealtimeLLMService(LLMService):
             input_sample_rate: Audio sample rate sent to Volcengine. The API
                 expects 16 kHz mono PCM by default.
             output_sample_rate: PCM audio sample rate requested from Volcengine.
+            enable_websearch: Enable the model's built-in web search so it can
+                answer questions about real-time information (weather, news,
+                etc.). This is server-side search, not client-side function
+                calling — the realtime API does not support custom tools.
+            websearch_api_key: Access key for Volcengine's 融合信息搜索 (fused
+                information search) service. Required when ``enable_websearch``
+                is True.
+            websearch_type: Search service type — ``"web"`` (default),
+                ``"web_summary"``, or ``"web_agent"``.
+            websearch_bot_id: Search Agent bot id, required for the
+                ``"web_agent"`` search type.
+            websearch_result_count: Number of search results to use (max 10).
+            greeting: Optional greeting the bot speaks as soon as the session
+                starts (sent via the ``SayHello`` event). Use this instead of a
+                client-side kickoff to avoid races with session startup.
             settings: Runtime-updatable service settings.
             **kwargs: Additional arguments passed to ``LLMService``.
         """
@@ -376,6 +398,18 @@ class VolcengineRealtimeLLMService(LLMService):
             enable_custom_vad=None,
             enable_asr_twopass=None,
             extra={},
+            # Inherited LLMSettings fields — unused by the realtime model, but
+            # set to None so settings validation sees every field initialized.
+            system_instruction=None,
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            top_k=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            seed=None,
+            filter_incomplete_user_turns=None,
+            user_turn_completion_config=None,
         )
         if settings is not None:
             default_settings.apply_update(settings)
@@ -390,6 +424,12 @@ class VolcengineRealtimeLLMService(LLMService):
         self._uid = uid
         self._input_sample_rate = input_sample_rate
         self._output_sample_rate = output_sample_rate
+        self._enable_websearch = enable_websearch
+        self._websearch_api_key = websearch_api_key
+        self._websearch_type = websearch_type
+        self._websearch_bot_id = websearch_bot_id
+        self._websearch_result_count = websearch_result_count
+        self._greeting = greeting
 
         self._socket: websocket_client.ClientConnection | None = None
         self._receive_task = None
@@ -459,7 +499,14 @@ class VolcengineRealtimeLLMService(LLMService):
 
         try:
             logger.debug(f"{self} connecting to Volcengine realtime WebSocket")
-            self._socket = await websocket_client.connect(self._url, additional_headers=headers)
+            # Disable the websockets client keepalive ping: Volcengine's realtime
+            # server does not reliably answer protocol-level ping frames, which
+            # otherwise triggers a spurious 1011 "keepalive ping timeout" close
+            # mid-conversation. The continuous audio stream keeps the connection
+            # alive at the application level.
+            self._socket = await websocket_client.connect(
+                self._url, additional_headers=headers, ping_interval=None, max_size=None
+            )
             await self._send_message(_Message.from_payload(event=_Event.START_CONNECTION))
 
             reply = _Message.unmarshal(await self._socket.recv())
@@ -530,7 +577,7 @@ class VolcengineRealtimeLLMService(LLMService):
             },
             "dialog": {
                 "extra": {
-                    "input_mod": settings.input_mod,
+                    "input_mod": settings.input_mod or "keep_alive",
                     "model": settings.model or VOLCENGINE_REALTIME_DEFAULT_MODEL,
                 }
             },
@@ -549,6 +596,18 @@ class VolcengineRealtimeLLMService(LLMService):
             value = getattr(settings, key)
             if value is not None:
                 dialog[key] = value
+
+        if self._enable_websearch:
+            dialog_extra = dialog["extra"]
+            dialog_extra["enable_volc_websearch"] = True
+            if self._websearch_api_key:
+                dialog_extra["volc_websearch_api_key"] = self._websearch_api_key
+            if self._websearch_type:
+                dialog_extra["volc_websearch_type"] = self._websearch_type
+            if self._websearch_bot_id:
+                dialog_extra["volc_websearch_bot_id"] = self._websearch_bot_id
+            if self._websearch_result_count is not None:
+                dialog_extra["volc_websearch_result_count"] = self._websearch_result_count
 
         payload.update(settings.extra)
         return payload
@@ -579,6 +638,24 @@ class VolcengineRealtimeLLMService(LLMService):
             return
         await self._send_session_event(_Event.CHAT_TEXT_QUERY, {"content": text})
         await self.start_ttfb_metrics()
+
+    async def say_hello(self, content: str):
+        """Make the bot open the conversation by speaking a greeting.
+
+        Sends a ``SayHello`` event so the realtime model speaks ``content`` as
+        the first turn. Useful to kick off a conversation when the client
+        connects.
+
+        Args:
+            content: The greeting text the bot should speak.
+        """
+        if not content or not self._socket or self._socket.state is not State.OPEN:
+            return
+        await self._send_session_event(_Event.SAY_HELLO, {"content": content})
+        # The server speaks the SayHello content but sends no ChatResponse event
+        # for it, so emit the assistant text ourselves so the greeting appears
+        # in transcripts and is added to the conversation context.
+        await self._emit_assistant_text(content)
 
     async def _send_client_interrupt(self):
         """Notify Volcengine that the client interrupted the current response."""
@@ -639,6 +716,10 @@ class VolcengineRealtimeLLMService(LLMService):
             dialog_id = payload.get("dialog_id")
             if dialog_id:
                 logger.debug(f"{self} Volcengine dialog_id={dialog_id}")
+            # Send the opening greeting now that the session is confirmed
+            # started — this avoids racing the (multi-second) session startup.
+            if self._greeting:
+                await self.say_hello(self._greeting)
         elif event == _Event.ASR_INFO:
             await self.push_frame(InterruptionFrame())
         elif event == _Event.ASR_RESPONSE:
@@ -657,19 +738,27 @@ class VolcengineRealtimeLLMService(LLMService):
             logger.debug(f"{self} Volcengine realtime lifecycle event {event}")
 
     async def _handle_asr_response(self, payload: dict[str, Any]):
-        """Emit user transcription frames from ASRResponse payloads."""
+        """Emit user transcription frames from ASRResponse payloads.
+
+        Interim results are emitted as ``InterimTranscriptionFrame``; only final
+        results become ``TranscriptionFrame``. This matters because the
+        pipeline's user-turn detection treats every ``TranscriptionFrame`` as a
+        completed turn — emitting interim results as ``TranscriptionFrame``
+        would trigger a storm of spurious user turns and interruptions.
+        """
         for result in payload.get("results") or []:
             text = result.get("text")
             if not text:
                 continue
-            is_interim = result.get("is_interim", False)
-            frame = TranscriptionFrame(
-                text=text,
-                user_id=self._last_user_id,
-                timestamp=time_now_iso8601(),
-                result=payload,
-                finalized=not is_interim,
-            )
+            frame: Frame
+            if result.get("is_interim", False):
+                frame = InterimTranscriptionFrame(
+                    text, self._last_user_id, time_now_iso8601(), result=payload
+                )
+            else:
+                frame = TranscriptionFrame(
+                    text, self._last_user_id, time_now_iso8601(), result=payload
+                )
             await self.push_frame(frame, FrameDirection.UPSTREAM)
 
     async def _handle_chat_response(self, payload: dict[str, Any]):
@@ -677,6 +766,17 @@ class VolcengineRealtimeLLMService(LLMService):
         text = payload.get("content")
         if not text:
             return
+        await self._emit_assistant_text(text)
+
+    async def _emit_assistant_text(self, text: str):
+        """Emit assistant text frames so text shows in transcripts and context.
+
+        Pushes an ``LLMTextFrame`` and a ``TTSTextFrame``, opening the LLM
+        response (``LLMFullResponseStartFrame``) if one is not already in
+        progress. Used both for streamed ``ChatResponse`` deltas and for the
+        ``SayHello`` greeting, which the server speaks without a matching
+        ``ChatResponse`` event.
+        """
         if not self._bot_responding:
             await self.start_processing_metrics()
             await self.stop_ttfb_metrics()
